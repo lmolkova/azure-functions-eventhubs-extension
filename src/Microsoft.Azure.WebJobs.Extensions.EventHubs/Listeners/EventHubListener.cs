@@ -315,7 +315,7 @@ namespace Microsoft.Azure.WebJobs.EventHubs
             {
                 link = null;
 
-                if ((message.SystemProperties.TryGetValue("Diagnostic-Id", out var diagnosticIdObj) || message.Properties.TryGetValue("Diagnostic-Id", out diagnosticIdObj)) 
+                if (((message.SystemProperties != null && message.SystemProperties.TryGetValue("Diagnostic-Id", out var diagnosticIdObj)) || message.Properties.TryGetValue("Diagnostic-Id", out diagnosticIdObj)) 
                     && diagnosticIdObj is string diagnosticIdString)
                 {
                     link = new Activity("Microsoft.Azure.EventHubs.Process");
