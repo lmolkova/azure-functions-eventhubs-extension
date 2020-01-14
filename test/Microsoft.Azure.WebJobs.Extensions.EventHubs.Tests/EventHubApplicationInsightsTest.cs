@@ -40,7 +40,7 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
         private static string _testPrefix;
         private readonly string _connection;
         private readonly string _endpoint;
-        private static int _receivedMessageCount = -1;
+
         private readonly EventHubsConnectionStringBuilder _connectionBuilder;
         private readonly JsonSerializerSettings jsonSettingThrowOnError = new JsonSerializerSettings
         {
@@ -52,7 +52,6 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
 
         public EventHubApplicationInsightsTests()
         {
-            _receivedMessageCount = -1;
             _eventWait = new ManualResetEvent(initialState: false);
             _testPrefix = Guid.NewGuid().ToString();
 
@@ -121,13 +120,12 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
         [Fact]
         public async Task EventHub_MultipleDispatch_BatchSend()
         {
-            object receivedEventsCount = (object)-1;
             using (var host = BuildHost<EventHubTestMultipleDispatchJobs>())
             {
                 await host.StartAsync();
 
                 var method = typeof(EventHubTestMultipleDispatchJobs).GetMethod("SendEvents_TestHub", BindingFlags.Static | BindingFlags.Public);
-                await host.GetJobHost().CallAsync(method, new { numEvents = 5, input = _testPrefix });
+                await host.GetJobHost().CallAsync(method, new { input = _testPrefix });
 
                 bool result = _eventWait.WaitOne(Timeout);
                 Assert.True(result);
@@ -155,8 +153,9 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                 manualCallRequest.Id,
                 LogCategories.Bindings);
 
-            var ehTriggerRequests = requests.Where(r => r.Context.Operation.Name == "ProcessMultipleEvents");
-            List<TestLink> actualLinks = new List<TestLink>();
+            var ehTriggerRequests = requests.Where(r => r.Context.Operation.Name == "ProcessMultipleEvents").ToList();
+            List<TestLink> allLinks = new List<TestLink>();
+
             foreach (var ehTriggerRequest in ehTriggerRequests)
             {
                 if (ehTriggerRequest.Properties.TryGetValue("_MS.links", out var linksStr))
@@ -171,19 +170,21 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
                     Assert.NotNull(ehTriggerRequest.Context.Operation.Id);
                     Assert.Null(ehTriggerRequest.Context.Operation.ParentId);
 
-                    actualLinks.AddRange(JsonConvert.DeserializeObject<TestLink[]>(linksStr, jsonSettingThrowOnError));
+                    var currentRequestAndTestLinks = JsonConvert.DeserializeObject<TestLink[]>(linksStr, jsonSettingThrowOnError)
+                        .Where(l => l.operation_Id == manualOperationId)
+                        .ToArray();
+                    allLinks.AddRange(currentRequestAndTestLinks);
+
+                    Assert.True(ehTriggerRequest.Properties.TryGetValue("receivedMessages", out var receivedMessagesPropStr));
+                    Assert.Equal(int.Parse(receivedMessagesPropStr), currentRequestAndTestLinks.Length);
                 }
             }
-
-            Assert.Equal(_receivedMessageCount, actualLinks.Count); 
-
-            var currentTestLinks = actualLinks.Where(l => l.operation_Id == manualOperationId).ToArray();
 
             // there should be 5 relevant links
             // current Event Hubs SDK does not generate unique Id per message, 
             // so they all share the same Id
-            Assert.Equal(_receivedMessageCount, currentTestLinks.Length); 
-            Assert.Equal(_receivedMessageCount, currentTestLinks.Count(l => l.id == ehOutDependency.Id));
+            Assert.Equal(EventHubTestMultipleDispatchJobs.ProcessedEvents, allLinks.Count);
+            Assert.Equal(EventHubTestMultipleDispatchJobs.ProcessedEvents, allLinks.Count(l => l.id == ehOutDependency.Id));
         }
 
         [Fact]
@@ -429,10 +430,15 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
 
         public class EventHubTestMultipleDispatchJobs
         {
-            public static void SendEvents_TestHub(int numEvents, string input, [EventHub(TestHubName)] out EventData[] events)
+            public static int ProcessedEvents = 0;
+            public const int EventCount = 5;
+            private static readonly object lck = new object();
+            
+            public static void SendEvents_TestHub(string input, [EventHub(TestHubName)] out EventData[] events)
             {
-                events = new EventData[numEvents];
-                for (int i = 0; i < numEvents; i++)
+                ProcessedEvents = 0;
+                events = new EventData[EventCount];
+                for (int i = 0; i < EventCount; i++)
                 {
                     var evt = new EventData(Encoding.UTF8.GetBytes(input + i));
                     events[i] = evt;
@@ -441,10 +447,16 @@ namespace Microsoft.Azure.WebJobs.Host.EndToEndTests
 
             public static void ProcessMultipleEvents([EventHubTrigger(TestHubName)] string[] events)
             {
-                if (events.Any(e => e.StartsWith(_testPrefix + "4")))
+                var eventsFromCurrentTest = events.Where(e => e.StartsWith(_testPrefix)).ToArray();
+                Activity.Current.AddTag("receivedMessages", eventsFromCurrentTest.Length.ToString());
+                lock (lck)
+                {
+                    ProcessedEvents += eventsFromCurrentTest.Length;
+                }
+                
+                if (ProcessedEvents >= EventCount)
                 {
                     _eventWait.Set();
-                    _receivedMessageCount = events.Length;
                 }
             }
         }
